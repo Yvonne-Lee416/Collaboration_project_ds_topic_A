@@ -1,0 +1,5 @@
+"Outcome","Interaction","p_value"
+"AF","treatment*age",3.85205111938107e-41
+"AF","treatment*sex",0.127006411499856
+"PR","treatment*age",0.132515287172254
+"PR","treatment*sex",0.0381473576221788

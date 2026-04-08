@@ -1,0 +1,618 @@
+---
+title: "FITFR analysis (working draft)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Working directory = project root (this file lives in Rmd/, but paths keep using raw-data/, figs/, etc.)
+inp <- knitr::current_input(dir = TRUE)
+if (!is.null(inp) && nzchar(inp)) {
+  knitr::opts_knit$set(root.dir = normalizePath(file.path(dirname(inp), ".."), winslash = "/"))
+} else if (dir.exists("../raw-data")) {
+  knitr::opts_knit$set(root.dir = normalizePath("..", winslash = "/"))
+}
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+dir.create("derived-data", showWarnings = FALSE, recursive = TRUE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "figs/"
+)
+```
+
+## 1. Load data
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(broom)
+library(emmeans)
+library(forcats)
+library(scales)
+
+# ---------- plotting style (academic, low-contrast) ----------
+# Font: Times New Roman (falls back if unavailable on the system)
+base_family <- "Times New Roman"
+
+# Low-contrast, academic-ish palette (muted)
+pal_trt <- c(A = "#4E79A7", B = "#59A14F", C = "#9C755F")
+col_dark <- "#2F2F2F"
+col_mid <- "#6A6A6A"
+col_grid <- "#E6E6E6"
+col_fill <- "#B9C4D6"  # soft blue-grey
+
+theme_fitfr <- theme_minimal(base_size = 12, base_family = base_family) +
+  theme(
+    plot.title = element_text(face = "bold", color = col_dark),
+    axis.title = element_text(color = col_dark),
+    axis.text = element_text(color = col_mid),
+    panel.grid.major = element_line(color = col_grid, linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(color = col_dark),
+    legend.text = element_text(color = col_mid)
+  )
+
+path_xlsx <- file.path("raw-data", "FITFR-final-data-v3.xlsx")
+stopifnot(file.exists(path_xlsx))
+
+# Notes:
+# - Row 1 in the spreadsheet is a group header (demographics / genetics / measures)
+# - Row 2 contains the actual variable names
+# - Data start on the following row; we therefore read with skip = 1
+raw <- read_excel(path_xlsx, sheet = 1, skip = 1)
+
+dim(raw)
+names(raw)
+```
+
+## 2. Quick data overview
+
+```{r}
+raw %>% dplyr::glimpse()
+
+key_vars <- c("ID", "age", "sex", "treatment", "smoker", "AF", "PR")
+stopifnot(all(key_vars %in% names(raw)))
+
+# Missingness in key variables
+sapply(raw[key_vars], function(x) mean(is.na(x))) %>%
+  sort(decreasing = TRUE)
+```
+
+## 3. Basic cleaning (all downstream analyses use `cleaned`)
+
+```{r}
+# SNPs: Excel stores two-letter diplotypes (e.g., AA, AT). Recode to additive dosage 0/1/2
+# as the count of the alphabetically SECOND allele (a reproducible convention without VCF REF/ALT).
+diplotype_to_dosage <- function(x) {
+  if (is.numeric(x)) return(suppressWarnings(as.numeric(x)))
+  x <- as.character(x)
+  out <- rep(NA_real_, length(x))
+  ok <- !is.na(x) & nchar(x) == 2L
+  if (!any(ok)) return(out)
+  xnum <- suppressWarnings(as.numeric(x))
+  if (sum(!is.na(xnum)) > 0.5 * sum(ok) && all(stats::na.omit(xnum) %in% c(0, 1, 2))) {
+    return(xnum)
+  }
+  chars_ok <- unlist(strsplit(x[ok], "", fixed = TRUE), use.names = FALSE)
+  alleles <- sort(unique(stats::na.omit(chars_ok)))
+  alleles <- alleles[nzchar(alleles)]
+  if (length(alleles) < 2L) return(out)
+  alt <- alleles[2L]
+  sp <- strsplit(x, "", fixed = TRUE)
+  for (i in which(ok)) {
+    pair <- sp[[i]]
+    if (length(pair) == 2L) out[i] <- sum(pair == alt)
+  }
+  out
+}
+
+cleaned <- raw %>%
+  # Drop empty / invalid rows (rows without ID carry no usable information here)
+  filter(!is.na(ID)) %>%
+  mutate(
+    # Age: -99 is the missing sentinel (FITFR_Summary); other invalid/negative values -> NA
+    age = suppressWarnings(as.numeric(age)),
+    age = if_else(is.finite(age) & age == -99, NA_real_, age),
+    age = if_else(age < 0 | !is.finite(age), NA_real_, age),
+
+    # Standardize categorical values
+    sex = str_to_lower(str_trim(sex)),
+    sex = case_when(
+      sex %in% c("f", "female") ~ "female",
+      sex %in% c("m", "male") ~ "male",
+      TRUE ~ sex
+    ),
+
+    treatment = str_to_upper(str_trim(treatment)),
+    smoker = str_to_upper(str_trim(smoker)),
+
+    # PR: yes/no binary outcome
+    PR = str_to_lower(str_trim(PR)),
+    PR = case_when(
+      PR %in% c("yes", "y", "1", "true") ~ "yes",
+      PR %in% c("no", "n", "0", "false") ~ "no",
+      TRUE ~ PR
+    ),
+    PR = factor(PR, levels = c("no", "yes")),
+
+    # AF: numeric (may be read as character)
+    AF = suppressWarnings(as.numeric(AF)),
+    across(matches("^rs", ignore.case = TRUE), diplotype_to_dosage)
+  )
+
+snp_cols_all <- names(cleaned)[grepl("^rs", names(cleaned), ignore.case = TRUE)]
+is_mono <- vapply(snp_cols_all, function(s) length(unique(stats::na.omit(cleaned[[s]]))) < 2L, logical(1))
+snp_cols <- setdiff(snp_cols_all[!is_mono], "rs123456")
+
+cleaned %>% dplyr::glimpse()
+
+# Missingness after cleaning (key variables)
+sapply(cleaned[key_vars], function(x) mean(is.na(x))) %>%
+  sort(decreasing = TRUE)
+```
+
+## 3.1 EDA (exploratory data analysis)
+
+```{r}
+# Quick distributions / missingness snapshot (EDA)
+key_for_eda <- c("age", "sex", "treatment", "smoker", "AF", "PR")
+
+eda_missing <- cleaned %>%
+  summarise(across(all_of(key_for_eda), ~ mean(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_rate") %>%
+  arrange(desc(missing_rate))
+eda_missing
+```
+
+```{r fig.width=7, fig.height=4}
+p_age <- cleaned %>%
+  ggplot(aes(x = age)) +
+  geom_histogram(bins = 15, fill = col_fill, color = "white") +
+  labs(title = "Age distribution", x = "Age", y = "Count") +
+  theme_fitfr
+p_age
+ggsave(
+  filename = file.path("figs", "00_EDA_age_distribution.png"),
+  plot = p_age,
+  width = 7,
+  height = 4,
+  dpi = 300,
+  bg = "white"
+)
+
+p_af_dist <- cleaned %>%
+  filter(!is.na(AF)) %>%
+  ggplot(aes(x = AF)) +
+  geom_histogram(bins = 18, fill = col_fill, color = "white") +
+  labs(title = "AF distribution", x = "AF", y = "Count") +
+  theme_fitfr
+p_af_dist
+ggsave(
+  filename = file.path("figs", "00_EDA_AF_distribution.png"),
+  plot = p_af_dist,
+  width = 7,
+  height = 4,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+```{r fig.width=7, fig.height=4}
+p_age_af <- cleaned %>%
+  filter(!is.na(AF), !is.na(age)) %>%
+  ggplot(aes(x = age, y = AF, color = treatment)) +
+  geom_point(alpha = 0.7, size = 1.7) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8, alpha = 0.12) +
+  scale_color_manual(values = pal_trt) +
+  labs(title = "AF vs age (by treatment)", x = "Age", y = "AF", color = "Treatment") +
+  theme_fitfr
+p_age_af
+ggsave(
+  filename = file.path("figs", "00_EDA_AF_vs_age.png"),
+  plot = p_age_af,
+  width = 7,
+  height = 4,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+```{r fig.width=7, fig.height=4}
+# PR vs age: visualize trend using age bins (EDA-friendly)
+pr_age_bin <- cleaned %>%
+  filter(!is.na(PR), !is.na(age)) %>%
+  mutate(age_bin = cut(age, breaks = seq(24, 46, by = 4), right = FALSE, include.lowest = TRUE)) %>%
+  filter(!is.na(age_bin)) %>%
+  group_by(age_bin) %>%
+  summarise(
+    n = n(),
+    y = sum(PR == "yes"),
+    prop = y / n,
+    .groups = "drop"
+  )
+
+p_pr_age <- pr_age_bin %>%
+  ggplot(aes(x = age_bin, y = prop, group = 1)) +
+  geom_point(size = 2.0, color = pal_trt[["A"]]) +
+  geom_line(linewidth = 0.75, color = pal_trt[["A"]]) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(title = "PR(yes) rate by age bins", x = "Age bin", y = "PR yes rate") +
+  theme_fitfr +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_pr_age
+ggsave(
+  filename = file.path("figs", "00_EDA_PR_by_age_bins.png"),
+  plot = p_pr_age,
+  width = 7,
+  height = 4,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+## 4. (Optional) Save cleaned data as RDS
+
+```{r}
+saveRDS(cleaned, file = file.path("derived-data", "fitfr_cleaned.rds"))
+```
+
+## 5. Phase-1 results (quick plots + summary statistics)
+
+### 5.1 Sample overview and stratified summaries
+
+```{r}
+cleaned %>%
+  summarise(
+    n = n(),
+    n_treatment = n_distinct(treatment),
+    n_sex = n_distinct(sex),
+    n_smoker = n_distinct(smoker),
+    missing_age = sum(is.na(age)),
+    missing_AF = sum(is.na(AF)),
+    missing_PR = sum(is.na(PR))
+  )
+
+# Key variable summary by treatment
+sum_by_trt <- cleaned %>%
+  group_by(treatment) %>%
+  summarise(
+    n = n(),
+    age_mean = mean(age, na.rm = TRUE),
+    age_sd = sd(age, na.rm = TRUE),
+    AF_mean = mean(AF, na.rm = TRUE),
+    AF_sd = sd(AF, na.rm = TRUE),
+    PR_yes = sum(PR == "yes", na.rm = TRUE),
+    PR_no = sum(PR == "no", na.rm = TRUE),
+    PR_yes_rate = mean(PR == "yes", na.rm = TRUE),
+    .groups = "drop"
+  )
+sum_by_trt
+
+# Note: `smoker` has zero variance in this dataset; its effect cannot be estimated
+table(cleaned$smoker, useNA = "ifany")
+```
+
+### 5.2 Key relationship plots (treatment vs AF / PR)
+
+```{r fig.width=7, fig.height=4}
+p_af <- cleaned %>%
+  filter(!is.na(AF)) %>%
+  ggplot(aes(x = treatment, y = AF, color = treatment)) +
+  geom_boxplot(
+    outlier.alpha = 0.25,
+    width = 0.55,
+    linewidth = 0.55,
+    color = col_mid
+  ) +
+  geom_jitter(width = 0.14, alpha = 0.55, size = 1.55) +
+  scale_color_manual(values = pal_trt) +
+  guides(color = "none") +
+  labs(
+    title = "AF by treatment",
+    x = "Treatment",
+    y = "AF"
+  ) +
+  theme_fitfr
+p_af
+
+ggsave(
+  filename = file.path("figs", "01_AF_by_treatment.png"),
+  plot = p_af,
+  width = 7,
+  height = 4,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+```{r fig.width=7, fig.height=4}
+pr_by_trt <- cleaned %>%
+  filter(!is.na(PR)) %>%
+  group_by(treatment) %>%
+  summarise(
+    n = n(),
+    y = sum(PR == "yes"),
+    prop = y / n,
+    se = sqrt(prop * (1 - prop) / n),
+    lo = pmax(0, prop - 1.96 * se),
+    hi = pmin(1, prop + 1.96 * se),
+    .groups = "drop"
+  )
+
+p_pr <- pr_by_trt %>%
+  ggplot(aes(x = treatment, y = prop, fill = treatment)) +
+  geom_col(width = 0.62, alpha = 0.85, color = NA) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.14, linewidth = 0.55, color = col_mid) +
+  scale_fill_manual(values = pal_trt) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  guides(fill = "none") +
+  labs(
+    title = "PR (yes) rate by treatment (approx. 95% CI)",
+    x = "Treatment",
+    y = "PR yes rate"
+  ) +
+  theme_fitfr
+p_pr
+
+ggsave(
+  filename = file.path("figs", "02_PR_yes_rate_by_treatment.png"),
+  plot = p_pr,
+  width = 7,
+  height = 4,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+### 5.3 Primary models (quick version)
+
+#### 5.3.1 AF: linear regression (adjust age + sex)
+
+```{r}
+df_af <- cleaned %>% filter(!is.na(AF))
+
+fit_af <- lm(AF ~ treatment + age + sex, data = df_af)
+summary(fit_af)
+
+# Overall treatment test (Type I ANOVA; quick)
+anova(fit_af)
+
+# Pairwise treatment comparisons (adjusted means)
+emm_af <- emmeans(fit_af, ~ treatment)
+pairs(emm_af, adjust = "tukey")
+
+# Coefficient table (report-friendly)
+broom::tidy(fit_af, conf.int = TRUE)
+```
+
+#### 5.3.2 PR: logistic regression (adjust age + sex)
+
+```{r}
+df_pr <- cleaned %>% filter(!is.na(PR))
+
+fit_pr <- glm(PR ~ treatment + age + sex, data = df_pr, family = binomial())
+summary(fit_pr)
+
+# Odds ratios (OR) and 95% CI
+or_pr <- broom::tidy(fit_pr, conf.int = TRUE, exponentiate = TRUE)
+or_pr
+
+# Overall treatment test (compare against model without treatment)
+fit_pr0 <- glm(PR ~ age + sex, data = df_pr, family = binomial())
+anova(fit_pr0, fit_pr, test = "Chisq")
+
+# Pairwise treatment comparisons (OR; marginal means)
+emm_pr <- emmeans(fit_pr, ~ treatment, type = "response")
+pairs(emm_pr, adjust = "tukey")
+```
+
+### 5.4 Genetics (SNP) exploratory: per-SNP association (with FDR)
+
+```{r}
+# `snp_cols`: defined in §3 cleaning (monomorphic loci and rs123456 removed)
+length(snp_cols)
+
+df_snp <- cleaned %>% select(ID, treatment, age, sex, AF, PR, all_of(snp_cols))
+
+# AF ~ SNP (exploratory: unadjusted association strength; can add covariates later)
+af_tests <- lapply(snp_cols, function(snp) {
+  d <- df_snp %>%
+    select(AF, all_of(snp)) %>%
+    filter(!is.na(AF), !is.na(.data[[snp]]))
+  if (nrow(d) < 10 || n_distinct(d[[snp]]) < 2) return(NULL)
+  fit <- lm(stats::reformulate(snp, response = "AF"), data = d)
+  a <- anova(fit)
+  tibble::tibble(
+    snp = snp,
+    n = nrow(d),
+    n_levels = n_distinct(d[[snp]]),
+    p = a$`Pr(>F)`[1]
+  )
+})
+af_tests <- dplyr::bind_rows(af_tests) %>%
+  mutate(p_fdr = p.adjust(p, method = "BH")) %>%
+  arrange(p)
+
+head(af_tests, 10)
+
+# PR ~ SNP (exploratory: 2xK chi-square; switch to Fisher if expected counts are too small)
+pr_tests <- lapply(snp_cols, function(snp) {
+  d <- df_snp %>%
+    select(PR, all_of(snp)) %>%
+    filter(!is.na(PR), !is.na(.data[[snp]]))
+  if (nrow(d) < 10 || n_distinct(d[[snp]]) < 2) return(NULL)
+  tab <- table(d$PR, d[[snp]])
+  if (any(dim(tab) < 2)) return(NULL)
+  # Use chi-square (fast); consider Fisher's exact test if needed
+  p <- suppressWarnings(chisq.test(tab)$p.value)
+  tibble::tibble(
+    snp = snp,
+    n = nrow(d),
+    n_levels = n_distinct(d[[snp]]),
+    p = p
+  )
+})
+pr_tests <- dplyr::bind_rows(pr_tests) %>%
+  mutate(p_fdr = p.adjust(p, method = "BH")) %>%
+  arrange(p)
+
+head(pr_tests, 10)
+```
+
+#### 5.4.1 SNP visualization (overview + top SNPs)
+
+```{r fig.width=7, fig.height=4}
+# Save result tables for reporting
+write.csv(af_tests, file = file.path("derived-data", "snp_AF_tests.csv"), row.names = FALSE)
+write.csv(pr_tests, file = file.path("derived-data", "snp_PR_tests.csv"), row.names = FALSE)
+
+prep_snp_plot <- function(tbl) {
+  tbl %>%
+    mutate(
+      snp = as.character(snp),
+      p = pmin(pmax(p, .Machine$double.xmin), 1),
+      neglog10p = -log10(p),
+      snp = forcats::fct_reorder(snp, neglog10p, .desc = TRUE)
+    )
+}
+
+af_plot_tbl <- prep_snp_plot(af_tests)
+pr_plot_tbl <- prep_snp_plot(pr_tests)
+
+fdr_cut <- 0.05
+af_thr <- if (any(af_tests$p_fdr <= fdr_cut)) max(af_plot_tbl$neglog10p[af_tests$p_fdr <= fdr_cut]) else NA_real_
+pr_thr <- if (any(pr_tests$p_fdr <= fdr_cut)) max(pr_plot_tbl$neglog10p[pr_tests$p_fdr <= fdr_cut]) else NA_real_
+
+p_snp_af_all <- af_plot_tbl %>%
+  mutate(snp = forcats::fct_rev(snp)) %>%
+  ggplot(aes(x = snp, y = neglog10p)) +
+  geom_col(width = 0.75, fill = col_fill) +
+  coord_flip() +
+  labs(
+    title = "SNP association with AF (unadjusted; -log10(p))",
+    x = NULL,
+    y = expression(-log[10](p))
+  ) +
+  theme_fitfr
+if (!is.na(af_thr)) {
+  p_snp_af_all <- p_snp_af_all +
+    geom_hline(yintercept = af_thr, linetype = "dashed", linewidth = 0.6, color = "#B22222") +
+    annotate("text", x = Inf, y = af_thr, label = "FDR 0.05 cutoff", hjust = 1.05, vjust = -0.4, size = 3.1, color = "#B22222")
+}
+p_snp_af_all
+ggsave(file.path("figs", "03_SNP_AF_all_neglog10p.png"), p_snp_af_all, width = 7, height = 6, dpi = 300, bg = "white")
+
+p_snp_pr_all <- pr_plot_tbl %>%
+  mutate(snp = forcats::fct_rev(snp)) %>%
+  ggplot(aes(x = snp, y = neglog10p)) +
+  geom_col(width = 0.75, fill = col_fill) +
+  coord_flip() +
+  labs(
+    title = "SNP association with PR (unadjusted; -log10(p))",
+    x = NULL,
+    y = expression(-log[10](p))
+  ) +
+  theme_fitfr
+if (!is.na(pr_thr)) {
+  p_snp_pr_all <- p_snp_pr_all +
+    geom_hline(yintercept = pr_thr, linetype = "dashed", linewidth = 0.6, color = "#B22222") +
+    annotate("text", x = Inf, y = pr_thr, label = "FDR 0.05 cutoff", hjust = 1.05, vjust = -0.4, size = 3.1, color = "#B22222")
+}
+p_snp_pr_all
+ggsave(file.path("figs", "04_SNP_PR_all_neglog10p.png"), p_snp_pr_all, width = 7, height = 6, dpi = 300, bg = "white")
+```
+
+```{r fig.width=7, fig.height=4}
+# Top 10 SNPs (smallest p-values)
+top_k <- 10
+top_af <- af_tests %>% slice_head(n = top_k) %>% mutate(neglog10p = -log10(p))
+top_pr <- pr_tests %>% slice_head(n = top_k) %>% mutate(neglog10p = -log10(p))
+
+p_snp_af_top <- top_af %>%
+  ggplot(aes(x = forcats::fct_reorder(snp, neglog10p), y = neglog10p)) +
+  geom_col(width = 0.7, fill = pal_trt[["A"]], alpha = 0.9) +
+  coord_flip() +
+  labs(
+    title = "Top SNPs associated with AF (smallest p-values)",
+    x = NULL,
+    y = expression(-log[10](p))
+  ) +
+  theme_fitfr
+p_snp_af_top
+ggsave(file.path("figs", "03_SNP_AF_top10.png"), p_snp_af_top, width = 7, height = 4.5, dpi = 300, bg = "white")
+
+p_snp_pr_top <- top_pr %>%
+  ggplot(aes(x = forcats::fct_reorder(snp, neglog10p), y = neglog10p)) +
+  geom_col(width = 0.7, fill = pal_trt[["B"]], alpha = 0.9) +
+  coord_flip() +
+  labs(
+    title = "Top SNPs associated with PR (smallest p-values)",
+    x = NULL,
+    y = expression(-log[10](p))
+  ) +
+  theme_fitfr
+p_snp_pr_top
+ggsave(file.path("figs", "04_SNP_PR_top10.png"), p_snp_pr_top, width = 7, height = 4.5, dpi = 300, bg = "white")
+```
+
+#### 5.4.2 Visualize top SNPs by genotype (AF distribution / PR positive rate)
+
+```{r fig.width=7, fig.height=4}
+plot_snp_af_by_genotype <- function(snp) {
+  d <- cleaned %>%
+    select(AF, all_of(snp)) %>%
+    filter(!is.na(AF), !is.na(.data[[snp]])) %>%
+    mutate(genotype = as.factor(.data[[snp]]))
+
+  ggplot(d, aes(x = genotype, y = AF)) +
+    geom_boxplot(outlier.alpha = 0.25, width = 0.6, fill = "#EEF2F7", color = col_mid, linewidth = 0.55) +
+    geom_jitter(width = 0.12, alpha = 0.55, size = 1.35, color = col_dark) +
+    labs(title = paste0("AF by genotype: ", snp), x = "Genotype", y = "AF") +
+    theme_fitfr
+}
+
+plot_snp_pr_by_genotype <- function(snp) {
+  d <- cleaned %>%
+    select(PR, all_of(snp)) %>%
+    filter(!is.na(PR), !is.na(.data[[snp]])) %>%
+    mutate(genotype = as.factor(.data[[snp]])) %>%
+    group_by(genotype) %>%
+    summarise(
+      n = n(),
+      y = sum(PR == "yes"),
+      prop = y / n,
+      se = sqrt(prop * (1 - prop) / n),
+      lo = pmax(0, prop - 1.96 * se),
+      hi = pmin(1, prop + 1.96 * se),
+      .groups = "drop"
+    )
+
+  ggplot(d, aes(x = genotype, y = prop)) +
+    geom_col(width = 0.65, fill = "#D9E2EC") +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.15, linewidth = 0.55, color = col_mid) +
+    scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(title = paste0("PR(yes) rate by genotype: ", snp), x = "Genotype", y = "PR yes rate") +
+    theme_fitfr
+}
+
+top_af_snp <- top_af$snp[1]
+top_pr_snp <- top_pr$snp[1]
+
+p_af_geno <- plot_snp_af_by_genotype(top_af_snp)
+p_af_geno
+ggsave(file.path("figs", paste0("05_AF_by_genotype_", top_af_snp, ".png")), p_af_geno, width = 7, height = 4, dpi = 300, bg = "white")
+
+p_pr_geno <- plot_snp_pr_by_genotype(top_pr_snp)
+p_pr_geno
+ggsave(file.path("figs", paste0("06_PR_by_genotype_", top_pr_snp, ".png")), p_pr_geno, width = 7, height = 4, dpi = 300, bg = "white")
+```

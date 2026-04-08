@@ -1,0 +1,21 @@
+
+--- AF model ---
+• Tested: Adjusted linear regression AF ~ treatment + age + sex.
+• Found: Evidence of an adjusted treatment effect on AF (F-test p < 0.001). Pairwise: A significantly lower than B and C; B vs C not significant (Tukey).
+• Claim: Treatment is associated with AF after adjustment. Do NOT claim causality without randomization.
+
+--- PR model ---
+• Tested: Adjusted logistic regression PR ~ treatment + age + sex.
+• Found: No strong evidence of an independent treatment effect on PR (LRT p ≈ 0.83). Age was positively associated with PR (OR > 1, p < 0.001).
+• Claim: Age is associated with PR; do not claim treatment affects PR.
+
+--- Interactions ---
+• Tested: treatment*age and treatment*sex for AF and PR.
+• Found: AF — formal F-test for treatment×age is often significant (check current output); FITFR_Summary EDA suggested parallel slopes — report both AIC and p-value: formal inference overrides visual judgment if they disagree. PR — treatment×age not significant; treatment×sex p ≈ 0.04 (exploratory).
+• Report: For AF, if interaction is significant, show adjusted patterns by treatment and age (e.g. emmeans or stratified summaries). For PR, claim interaction only if p < 0.05.
+
+--- Genetics ---
+• Tested: Additive dosage 0/1/2; single-SNP screens + FDR; marginal Pearson r with AF (`SNP_AF_Pearson_correlations.csv`); optional adjusted models for candidates in FITFR_Summary (rs19486, rs26922, rs88128 for AF; rs91154, rs56579, rs57179 for PR).
+• Found: No SNP survives FDR; |r| vs AF remain small (exploratory). n=100 limits power for SNP×treatment interactions.
+• Claim: Hypothesis-generating only; cite dosage cell sizes from `SNP_dosage_summary.csv` when interpreting homozygous-alt groups.
+

@@ -1,0 +1,6 @@
+"Variable","Test","p_value"
+"Age","ANOVA",0.0400233165191787
+"Sex","Chi-square",0.669753285731748
+"AF (ANOVA)","ANOVA",1.23486824205834e-26
+"AF (Kruskal–Wallis)","Kruskal–Wallis",3.3112417573293e-15
+"PR","Chi-square",0.13161176706717

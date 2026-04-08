@@ -1,0 +1,19 @@
+.Rproj.user
+.Rhistory
+.RData
+.httr-oauth
+.DS_Store
+.quarto
+
+# Editor / local
+.vscode/
+
+# Quarto / knitr HTML helpers (regenerate on render)
+*_files/
+
+# Accidental base graphics output
+Rplots.pdf
+
+# Optional extracted / purled scripts (regenerate if needed)
+derived-data/_analysis_extracted.R
+output/run_presentation.R
